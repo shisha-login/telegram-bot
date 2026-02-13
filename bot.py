@@ -8,6 +8,34 @@ import socket
 from aiohttp import web
 import asyncio
 import threading
+from aiohttp import web
+import asyncio
+
+# Веб-сервер для Render
+async def handle(request):
+    return web.Response(text="Бот работает!")
+
+async def run_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle)
+    app.router.add_get('/health', handle)
+    
+    port = int(os.environ.get('PORT', 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logger.info(f"🌐 Веб-сервер запущен на порту {port}")
+
+# ========== ИЗМЕНИ ФУНКЦИЮ main() ==========
+async def main():
+    logger.info("🚀 Бот запускается...")
+    
+    # Запускаем веб-сервер параллельно
+    asyncio.create_task(run_web_server())
+    
+    # Запускаем бота
+    await dp.start_polling(bot)
 
 # Веб-сервер, чтобы Render не ругался
 async def handle(request):
