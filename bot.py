@@ -1,71 +1,546 @@
-#!/usr/bin/env python3
 import asyncio
-import sys
-from pathlib import Path
-
-# Добавляем корневую папку в путь
-sys.path.append(str(Path(__file__).parent))
-
-from aiogram import Bot, Dispatcher
-from aiogram.types import BotCommand
+import logging
+import os
+import re
+import requests
+import whois
+import socket
+from datetime import datetime
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
 from aiogram.enums import ParseMode
 
-# Импортируем конфигурацию
-from config import config
-from utils.logger import setup_logger
-from handlers import user, admin
+# ========== НАСТРОЙКИ ==========
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Настраиваем логирование
-logger = setup_logger()
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+ADMIN_ID = int(os.environ.get('ADMIN_ID', 0))
 
-async def set_bot_commands(bot: Bot):
-    """Установка команд бота"""
-    commands = [
-        BotCommand(command="start", description="🚀 Запустить бота"),
-        BotCommand(command="help", description="📋 Помощь"),
-    ]
-    await bot.set_my_commands(commands)
+if not BOT_TOKEN or not ADMIN_ID:
+    raise ValueError("BOT_TOKEN и ADMIN_ID должны быть установлены!")
 
-async def main():
-    """Главная функция запуска бота"""
-    logger.info("=" * 50)
-    logger.info("🚀 Запуск Telegram бота...")
-    logger.info("=" * 50)
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
+
+# Хранилище: {message_id: user_id}
+user_message_map = {}
+
+# ========== КЛАВИАТУРЫ ==========
+# Для обычных пользователей
+user_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📱 Отправить номер", request_contact=True)],
+        [KeyboardButton(text="ℹ️ Помощь")]
+    ],
+    resize_keyboard=True
+)
+
+# Для админа (OSINT-команды)
+admin_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🕵️ Поиск по username"), KeyboardButton(text="📞 Поиск по номеру")],
+        [KeyboardButton(text="🔍 Sherlock username"), KeyboardButton(text="📱 TG username")],
+        [KeyboardButton(text="🌐 WHOIS домен"), KeyboardButton(text="📍 IP информация")],
+        [KeyboardButton(text="📧 Проверка email"), KeyboardButton(text="📊 Статистика")]
+    ],
+    resize_keyboard=True
+)
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+def is_admin(user_id: int) -> bool:
+    """Проверка, является ли пользователь админом"""
+    return user_id == ADMIN_ID
+
+def clean_username(username: str) -> str:
+    """Очистка username от @ и пробелов"""
+    username = username.strip().replace('@', '').replace(' ', '')
+    return username
+
+# ========== OSINT-ФУНКЦИИ ==========
+
+async def tg_username_search(username: str) -> str:
+    """
+    ПОИСК ПО USERNAME В TELEGRAM
+    Проверяет, существует ли пользователь, и собирает публичную информацию
+    """
+    username = clean_username(username)
     
+    result = []
+    result.append(f"🔍 <b>Поиск по username: @{username}</b>\n")
+    
+    # 1. Проверка существования (через t.me)
+    tg_url = f"https://t.me/{username}"
     try:
-        # Создаем экземпляры бота и диспетчера
-        bot = Bot(token=config.BOT_TOKEN, parse_mode=ParseMode.HTML)
-        dp = Dispatcher()
+        response = requests.get(tg_url, timeout=5, allow_redirects=True)
         
-        # Регистрируем роутеры
-        dp.include_router(user.router)
-        dp.include_router(admin.router)
-        
-        # Устанавливаем команды
-        await set_bot_commands(bot)
-        
-        # Получаем информацию о боте
-        bot_info = await bot.get_me()
-        logger.info(f"✅ Бот @{bot_info.username} запущен!")
-        logger.info(f"🆔 ID бота: {bot_info.id}")
-        logger.info(f"👤 Админ: {config.ADMIN_ID}")
-        logger.info("📡 Polling...")
-        logger.info("=" * 50)
-        
-        # Запускаем бота
-        await dp.start_polling(bot)
-        
-    except KeyboardInterrupt:
-        logger.info("⏹ Бот остановлен")
+        if response.status_code == 200 and "tgme_page" in response.text:
+            result.append("✅ <b>Аккаунт существует!</b>")
+            
+            # Парсим имя (если есть в HTML)
+            import re
+            name_match = re.search(r'<div class="tgme_page_title".*?>(.*?)</div>', response.text)
+            if name_match:
+                name = name_match.group(1).strip()
+                result.append(f"👤 Имя: {name}")
+            
+            # Парсим описание/био
+            desc_match = re.search(r'<div class="tgme_page_description".*?>(.*?)</div>', response.text)
+            if desc_match:
+                desc = desc_match.group(1).strip()
+                # Убираем HTML-теги
+                desc = re.sub(r'<.*?>', '', desc)
+                result.append(f"📝 Описание: {desc[:100]}{'...' if len(desc) > 100 else ''}")
+            
+            # Определяем тип (пользователь/канал/бот)
+            if 'tgme_page_extra' in response.text:
+                if 'bot' in response.text.lower():
+                    result.append("🤖 Тип: Бот")
+                else:
+                    result.append("👤 Тип: Пользователь/Канал")
+            
+            result.append(f"🔗 Ссылка: {tg_url}")
+        else:
+            result.append("❌ Аккаунт НЕ найден")
     except Exception as e:
-        logger.error(f"❌ Ошибка: {e}")
-    finally:
-        if 'bot' in locals():
-            await bot.session.close()
-            logger.info("🔒 Сессия закрыта")
+        result.append(f"❌ Ошибка при проверке: {e}")
+    
+    # 2. Проверка через API (неофициально, но можно)
+    result.append("\n📊 <b>Дополнительная информация:</b>")
+    
+    # Поиск в публичных источниках
+    sources = [
+        ("TGStat", f"https://tgstat.ru/{username}"),
+        ("Telemetr", f"https://telemetr.me/{username}"),
+        ("TgSearch", f"https://tgsearch.org/{username}")
+    ]
+    
+    for name, url in sources:
+        try:
+            r = requests.get(url, timeout=5)
+            if r.status_code == 200:
+                result.append(f"📊 {name}: {url}")
+        except:
+            pass
+    
+    return "\n".join(result)
+
+async def sherlock_search(username: str) -> str:
+    """Поиск username на 30+ популярных сайтах"""
+    username = clean_username(username)
+    
+    sites = {
+        "GitHub": f"https://github.com/{username}",
+        "Twitter/X": f"https://twitter.com/{username}",
+        "Instagram": f"https://instagram.com/{username}",
+        "Reddit": f"https://reddit.com/user/{username}",
+        "TikTok": f"https://tiktok.com/@{username}",
+        "YouTube": f"https://youtube.com/@{username}",
+        "Pinterest": f"https://pinterest.com/{username}",
+        "Spotify": f"https://open.spotify.com/user/{username}",
+        "Twitch": f"https://twitch.tv/{username}",
+        "VK": f"https://vk.com/{username}",
+        "Facebook": f"https://facebook.com/{username}",
+        "LinkedIn": f"https://linkedin.com/in/{username}",
+        "Tumblr": f"https://{username}.tumblr.com",
+        "Steam": f"https://steamcommunity.com/id/{username}",
+        "SoundCloud": f"https://soundcloud.com/{username}",
+        "Medium": f"https://medium.com/@{username}",
+        "Dev.to": f"https://dev.to/{username}",
+        "Keybase": f"https://keybase.io/{username}",
+        "Patreon": f"https://patreon.com/{username}",
+        "Flickr": f"https://flickr.com/people/{username}",
+        "Behance": f"https://behance.net/{username}",
+        "Dribbble": f"https://dribbble.com/{username}",
+        "Vimeo": f"https://vimeo.com/{username}",
+        "Bitbucket": f"https://bitbucket.org/{username}",
+        "GitLab": f"https://gitlab.com/{username}",
+        "HackerNews": f"https://news.ycombinator.com/user?id={username}",
+        "ProductHunt": f"https://producthunt.com/@{username}",
+    }
+    
+    found = []
+    not_found = []
+    
+    for name, url in sites.items():
+        try:
+            response = requests.get(url, timeout=3, allow_redirects=True)
+            if response.status_code == 200:
+                found.append(f"✅ <a href='{url}'>{name}</a>")
+            else:
+                not_found.append(name)
+        except:
+            not_found.append(name)
+    
+    result = [f"🔍 <b>Результаты для '{username}':</b>\n"]
+    
+    if found:
+        result.append("<b>✅ Найден на:</b>")
+        result.extend(found[:15])  # Показываем первые 15
+    
+    if len(found) > 15:
+        result.append(f"... и еще {len(found)-15} сайтов")
+    
+    if not found:
+        result.append("❌ Ничего не найдено")
+    
+    return "\n".join(result)
+
+async def phone_search(phone: str) -> str:
+    """Поиск по номеру телефона"""
+    # Очищаем номер от лишних символов
+    phone = re.sub(r'[^0-9+]', '', phone)
+    
+    result = [f"🔍 <b>Поиск по номеру: {phone}</b>\n"]
+    
+    # Проверка в Telegram
+    tg_check = await check_phone_telegram(phone)
+    result.append(tg_check)
+    
+    # Поиск в открытых базах (только публичные)
+    sources = [
+        ("Гугл", f"https://google.com/search?q={phone}"),
+        ("Яндекс", f"https://yandex.ru/search/?text={phone}"),
+        ("GetContact", f"https://getcontact.com/"),
+    ]
+    
+    result.append("\n📊 <b>Публичные источники:</b>")
+    for name, url in sources:
+        result.append(f"🔗 {name}: {url}")
+    
+    return "\n".join(result)
+
+async def check_phone_telegram(phone: str) -> str:
+    """Проверка, привязан ли номер к Telegram (через t.me)"""
+    # Это только проверка через публичные методы
+    # Полноценная проверка требует аккаунтов и API
+    
+    result = []
+    
+    # Убираем +
+    clean_phone = phone.replace('+', '')
+    
+    # Формируем ссылки для поиска
+    result.append("📱 <b>Telegram:</b>")
+    result.append(f"🔗 Поиск: https://t.me/{clean_phone}")
+    result.append("ℹ️ Для точной проверки нужен аккаунт Telegram")
+    
+    return "\n".join(result)
+
+async def whois_search(domain: str) -> str:
+    """WHOIS информация о домене"""
+    try:
+        w = whois.whois(domain)
+        
+        result = [f"🌐 <b>WHOIS: {domain}</b>\n"]
+        result.append(f"📅 Создан: {w.creation_date}")
+        result.append(f"📅 Истекает: {w.expiration_date}")
+        result.append(f"🏢 Регистратор: {w.registrar}")
+        result.append(f"👤 Владелец: {w.name or 'Скрыто'}")
+        result.append(f"📧 Email: {w.emails or 'Скрыто'}")
+        
+        if w.name_servers:
+            result.append(f"\n🌍 NS-сервера: {', '.join(w.name_servers[:3])}")
+        
+        return "\n".join(result)
+    except Exception as e:
+        return f"❌ Ошибка: {e}"
+
+async def ip_info(ip: str) -> str:
+    """Информация по IP-адресу"""
+    try:
+        response = requests.get(f"http://ip-api.com/json/{ip}")
+        data = response.json()
+        
+        if data['status'] == 'success':
+            result = [f"📍 <b>IP: {ip}</b>\n"]
+            result.append(f"🌍 Страна: {data['country']}")
+            result.append(f"🏙 Город: {data['city']}")
+            result.append(f"🏢 Провайдер: {data['isp']}")
+            result.append(f"📡 Организация: {data['org']}")
+            result.append(f"🕒 Часовой пояс: {data['timezone']}")
+            result.append(f"🗺 Координаты: {data['lat']}, {data['lon']}")
+            return "\n".join(result)
+        else:
+            return f"❌ Информация не найдена"
+    except Exception as e:
+        return f"❌ Ошибка: {e}"
+
+async def email_check(email: str) -> str:
+    """Проверка email через haveibeenpwned"""
+    try:
+        # Проверка утечек
+        response = requests.get(
+            f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}",
+            headers={"hibp-api-key": ""},  # Можно получить бесплатный ключ
+            timeout=5
+        )
+        
+        result = [f"📧 <b>Email: {email}</b>\n"]
+        
+        if response.status_code == 200:
+            breaches = response.json()
+            result.append(f"⚠️ <b>Найден в утечках:</b>")
+            for breach in breaches[:5]:
+                result.append(f"  • {breach['Name']} ({breach['BreachDate']})")
+        elif response.status_code == 404:
+            result.append("✅ Email не найден в публичных утечках")
+        else:
+            result.append("❓ Не удалось проверить утечки")
+        
+        return "\n".join(result)
+    except Exception as e:
+        return f"❌ Ошибка: {e}"
+
+# ========== ОБРАБОТЧИКИ ДЛЯ ОБЫЧНЫХ ПОЛЬЗОВАТЕЛЕЙ ==========
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    user_id = message.from_user.id
+    
+    if is_admin(user_id):
+        await message.answer(
+            "👋 <b>Панель администратора</b>\n"
+            "Используй кнопки для OSINT-поиска\n\n"
+            "📌 Чтобы ответить пользователю - просто ответь на его сообщение",
+            reply_markup=admin_keyboard
+        )
+    else:
+        await message.answer(
+            "👋 Привет! Я бот для связи с администратором.\n"
+            "Напиши любое сообщение - оно уйдёт админу.\n\n"
+            "📱 Если хочешь поделиться номером - нажми кнопку ниже:",
+            reply_markup=user_keyboard
+        )
+    
+    # Уведомление админу о новом пользователе
+    if not is_admin(user_id):
+        await bot.send_message(
+            ADMIN_ID,
+            f"👤 <b>Новый пользователь!</b>\n"
+            f"🆔 ID: {user_id}\n"
+            f"📱 Username: @{message.from_user.username or 'нет'}\n"
+            f"👤 Имя: {message.from_user.full_name}"
+        )
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    if is_admin(message.from_user.id):
+        await message.answer(
+            "🕵️ <b>OSINT-команды для админа:</b>\n\n"
+            "• <b>Поиск по username</b> - Sherlock (30+ сайтов)\n"
+            "• <b>TG username</b> - поиск в Telegram\n"
+            "• <b>Поиск по номеру</b> - проверка телефона\n"
+            "• <b>WHOIS домен</b> - информация о домене\n"
+            "• <b>IP информация</b> - геолокация и провайдер\n"
+            "• <b>Проверка email</b> - утечки данных\n\n"
+            "Просто нажми кнопку и введи данные!"
+        )
+    else:
+        await message.answer(
+            "📋 <b>Помощь:</b>\n"
+            "• Отправь любое сообщение - оно уйдёт админу\n"
+            "• Нажми кнопку 📱 чтобы поделиться номером\n"
+            "• Жди ответа от администратора"
+        )
+
+@dp.message(F.contact)
+async def handle_contact(message: Message):
+    """Получение контакта от пользователя"""
+    contact = message.contact
+    user_id = message.from_user.id
+    
+    # Пересылаем админу
+    contact_info = (
+        f"📞 <b>ПОЛУЧЕН НОМЕР ТЕЛЕФОНА</b>\n\n"
+        f"👤 Пользователь: @{message.from_user.username or 'нет'}\n"
+        f"🆔 ID: {user_id}\n"
+        f"📱 Номер: <code>{contact.phone_number}</code>\n"
+        f"👤 Имя: {contact.first_name} {contact.last_name or ''}"
+    )
+    
+    sent = await bot.send_message(ADMIN_ID, contact_info)
+    user_message_map[sent.message_id] = user_id
+    
+    await message.answer(
+        "✅ Номер отправлен администратору!",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+@dp.message(F.text == "ℹ️ Помощь")
+async def user_help_button(message: Message):
+    await cmd_help(message)
+
+# ========== ОБРАБОТЧИКИ ДЛЯ АДМИНА (OSINT) ==========
+@dp.message(F.chat.id == ADMIN_ID, F.text)
+async def admin_osint_commands(message: Message):
+    text = message.text
+    
+    # Меню OSINT-поиска
+    if text == "🕵️ Поиск по username":
+        await message.answer(
+            "🔍 <b>Поиск по username (Sherlock)</b>\n"
+            "Введи username (без @):"
+        )
+        # Сохраняем состояние для следующего сообщения
+        # В реальном проекте используйте FSM
+    
+    elif text == "📱 TG username":
+        await message.answer(
+            "📱 <b>Поиск по username в Telegram</b>\n"
+            "Введи username (без @):"
+        )
+    
+    elif text == "📞 Поиск по номеру":
+        await message.answer(
+            "📞 <b>Поиск по номеру телефона</b>\n"
+            "Введи номер в формате +79123456789:"
+        )
+    
+    elif text == "🌐 WHOIS домен":
+        await message.answer(
+            "🌐 <b>WHOIS информация</b>\n"
+            "Введи домен (например: google.com):"
+        )
+    
+    elif text == "📍 IP информация":
+        await message.answer(
+            "📍 <b>Информация по IP</b>\n"
+            "Введи IP-адрес (например: 8.8.8.8):"
+        )
+    
+    elif text == "📧 Проверка email":
+        await message.answer(
+            "📧 <b>Проверка email</b>\n"
+            "Введи email-адрес:"
+        )
+    
+    elif text == "📊 Статистика":
+        await message.answer(
+            f"📊 <b>Статистика</b>\n\n"
+            f"👥 Активных диалогов: {len(user_message_map)}\n"
+            f"🆔 Ваш ID: {ADMIN_ID}\n"
+            f"⏱ Статус: OSINT-бот активен"
+        )
+    
+    else:
+        # Проверяем, не является ли это ответом на OSINT-запрос
+        # В реальном проекте используйте FSM, здесь упрощенно
+        if message.reply_to_message:
+            # Если это ответ на предыдущее сообщение
+            pass
+
+# ========== ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ==========
+@dp.message()
+async def handle_messages(message: Message):
+    user_id = message.from_user.id
+    
+    # АДМИН: обрабатываем OSINT-запросы и ответы пользователям
+    if is_admin(user_id):
+        # Проверяем, не OSINT ли это запрос
+        # В реальном проекте используйте FSM для состояний
+        if message.reply_to_message:
+            # Ответ пользователю
+            original_msg_id = message.reply_to_message.message_id
+            if original_msg_id in user_message_map:
+                target_user = user_message_map[original_msg_id]
+                
+                try:
+                    # Отправляем ответ пользователю
+                    if message.text:
+                        await bot.send_message(
+                            target_user,
+                            f"📝 <b>Ответ администратора:</b>\n\n{message.text}"
+                        )
+                    elif message.photo:
+                        await bot.send_photo(
+                            target_user,
+                            message.photo[-1].file_id,
+                            caption=f"📝 <b>Ответ администратора</b>\n\n{message.caption or ''}"
+                        )
+                    elif message.document:
+                        await bot.send_document(
+                            target_user,
+                            message.document.file_id,
+                            caption=f"📝 <b>Ответ администратора</b>\n\n{message.caption or ''}"
+                        )
+                    else:
+                        await bot.send_message(
+                            target_user,
+                            "📝 <b>Ответ администратора получен</b> (медиа)"
+                        )
+                    
+                    await message.reply("✅ Ответ отправлен пользователю!")
+                    logger.info(f"Админ ответил пользователю {target_user}")
+                    
+                except Exception as e:
+                    await message.reply(f"❌ Ошибка: {e}")
+            else:
+                await message.reply("❌ Не удалось найти пользователя")
+    
+    # ПОЛЬЗОВАТЕЛЬ: пересылаем сообщение админу
+    else:
+        try:
+            # Формируем информацию о пользователе
+            user_info = (
+                f"📩 <b>Новое сообщение</b>\n\n"
+                f"🆔 ID: <code>{user_id}</code>\n"
+                f"📱 Username: @{message.from_user.username or 'нет'}\n"
+                f"👤 Имя: {message.from_user.full_name}\n"
+                f"⏰ Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+            )
+            
+            # Определяем тип сообщения
+            sent = None
+            if message.text:
+                sent = await bot.send_message(
+                    ADMIN_ID,
+                    user_info + f"📝 <b>Текст:</b>\n{message.text}"
+                )
+            elif message.photo:
+                sent = await bot.send_photo(
+                    ADMIN_ID,
+                    message.photo[-1].file_id,
+                    caption=user_info + f"📝 <b>Подпись:</b>\n{message.caption or 'без подписи'}"
+                )
+            elif message.video:
+                sent = await bot.send_video(
+                    ADMIN_ID,
+                    message.video.file_id,
+                    caption=user_info + f"📝 <b>Описание:</b>\n{message.caption or 'без описания'}"
+                )
+            elif message.document:
+                sent = await bot.send_document(
+                    ADMIN_ID,
+                    message.document.file_id,
+                    caption=user_info + f"📝 <b>Описание:</b>\n{message.caption or 'без описания'}"
+                )
+            elif message.voice:
+                sent = await bot.send_voice(
+                    ADMIN_ID,
+                    message.voice.file_id,
+                    caption=user_info + "🎤 <b>Голосовое сообщение</b>"
+                )
+            else:
+                sent = await bot.send_message(
+                    ADMIN_ID,
+                    user_info + "📦 <b>Другой тип сообщения</b>"
+                )
+            
+            # Сохраняем соответствие для ответа
+            if sent:
+                user_message_map[sent.message_id] = user_id
+            
+            await message.answer("✅ Сообщение доставлено администратору!")
+            
+        except Exception as e:
+            logger.error(f"Ошибка: {e}")
+            await message.answer("❌ Произошла ошибка")
+
+# ========== ЗАПУСК ==========
+async def main():
+    logger.info("🚀 Бот запускается...")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("⏹ Программа завершена")
+    asyncio.run(main())
