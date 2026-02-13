@@ -5,6 +5,23 @@ import re
 import requests
 import whois
 import socket
+from aiohttp import web
+import asyncio
+import threading
+
+# Веб-сервер, чтобы Render не ругался
+async def handle(request):
+    return web.Response(text="Бот работает!")
+
+async def run_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle)
+    port = int(os.environ.get('PORT', 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logger.info(f"🌐 Веб-сервер запущен на порту {port}")
 from datetime import datetime
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
