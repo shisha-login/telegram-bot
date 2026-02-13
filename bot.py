@@ -67,7 +67,9 @@ admin_keyboard = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True
 )
-
+@dp.message(Command("start"))
+async def start(message: Message):
+    await message.answer("👋 Привет!")
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 def is_admin(user_id: int) -> bool:
     """Проверка, является ли пользователь админом"""
